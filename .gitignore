@@ -1,0 +1,18 @@
+# Environment variables and local credentials
+.env
+.env.*
+!.env.example
+
+# Python environments and generated files
+__pycache__/
+*.py[cod]
+*.log
+venv/
+.venv/
+env/
+
+# Generated local vector index / model data
+faiss_index/
+*.faiss
+*.idx
+.DS_Store
