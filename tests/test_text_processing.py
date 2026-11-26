@@ -56,6 +56,21 @@ class CleanerTests(unittest.TestCase):
         self.assertEqual(title, "Café")
         self.assertIn("Crème brûlée", sections[0][1])
 
+    def test_compound_state_classes_do_not_remove_the_page(self):
+        # Wikipedia puts "...-main-menu-pinned-disabled" on <html>; that must not delete the article.
+        html = ('<html class="client-js vector-feature-main-menu-pinned-disabled"><head><title>RAG</title></head>'
+                '<body><div class="vector-main-menu-container">Menu</div><main class="mw-body"><h1>RAG</h1>'
+                '<div class="mw-parser-output"><p>Retrieval-augmented generation lets models use external data.</p></div>'
+                '</main></body></html>')
+        title, sections = parse_html(html)
+        self.assertEqual(title, "RAG")
+        self.assertIn("external data", sections[0][1])
+        self.assertNotIn("Menu", "\n".join(t for _, t in sections))
+
+    def test_falls_back_when_filter_removes_everything(self):
+        html = '<html><body><div class="sidebar"><p>Only content lives in a sidebar-classed div.</p></div></body></html>'
+        self.assertIn("Only content", parse_html(html)[1][0][1])
+
 
 if __name__ == "__main__":
     unittest.main()
