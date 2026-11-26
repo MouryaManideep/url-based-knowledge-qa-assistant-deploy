@@ -7,7 +7,7 @@ from typing import List, Tuple
 from pypdf import PdfReader
 
 from config import MAX_EXTRACTED_CHARS, MAX_FILE_BYTES, MAX_PDF_PAGES
-from rag.types import SourceError
+from rag.types import NeedsOCR, SourceError
 from utils.logger import setup_logger
 
 logger = setup_logger("pdf_loader")
@@ -54,5 +54,5 @@ def load_pdf(data: bytes, file_name: str) -> Tuple[str, List[Tuple[int, str]]]:
             pages.append((number, text))
 
     if not pages:
-        raise SourceError("No extractable text (scanned or image-only PDFs are not supported).")
+        raise NeedsOCR("This PDF is a scan with no text layer.", page_count=page_count)
     return title, pages

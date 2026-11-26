@@ -46,6 +46,9 @@ MAX_WEB_BYTES = 5 * 1024 * 1024
 MAX_FILE_BYTES = 25 * 1024 * 1024
 MAX_PDF_PAGES = 500
 MAX_EXTRACTED_CHARS = 3_000_000
+# OCR of scans and photos runs on Gemini; keep requests within its inline-upload and output limits.
+MAX_OCR_PAGES = 30
+MAX_OCR_BYTES = 18 * 1024 * 1024
 
 # Chunking defaults
 DEFAULT_CHUNK_SIZE = 1000

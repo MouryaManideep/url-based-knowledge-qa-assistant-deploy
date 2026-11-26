@@ -10,6 +10,14 @@ class SourceError(Exception):
     """A source could not be ingested. The message is safe to show to users."""
 
 
+class NeedsOCR(SourceError):
+    """The file has no text layer (a scan or a photo); its text can only be read with OCR."""
+
+    def __init__(self, message: str, page_count: int = 1):
+        super().__init__(message)
+        self.page_count = page_count
+
+
 @dataclass(frozen=True)
 class Chunk:
     text: str
