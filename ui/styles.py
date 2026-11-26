@@ -31,7 +31,7 @@ div[role="radiogroup"] {gap:.25rem;}
 WELCOME = """
 <div class="steps">
   <div class="step"><div class="num">1</div><h4>Add sources</h4>
-    <p>Paste web page links or upload PDFs and text files in the sidebar.</p></div>
+    <p>Paste web links or upload PDFs, scans, photos of documents and text files.</p></div>
   <div class="step"><div class="num">2</div><h4>Ask questions</h4>
     <p>Hybrid semantic and keyword search finds the most relevant passages.</p></div>
   <div class="step"><div class="num">3</div><h4>Check the citations</h4>
