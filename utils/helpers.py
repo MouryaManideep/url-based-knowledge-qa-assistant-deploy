@@ -46,6 +46,12 @@ def md_escape(value: Any) -> str:
     return re.sub(r"([\\`*_{}\[\]()#+\-.!|>~<$])", r"\\\1", text)
 
 
+def md_code(value: Any) -> str:
+    """Show untrusted text (such as a URL) verbatim as inline code, without escape backslashes."""
+    text = str(value).replace("`", "'").replace("\r", " ").replace("\n", " ")
+    return f"`{text}`"
+
+
 def safe_link(url: Any) -> str:
     return quote(str(url), safe=":/?#[]@!$&'*,;=%+~-._")
 

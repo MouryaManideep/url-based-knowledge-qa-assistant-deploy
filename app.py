@@ -32,7 +32,7 @@ from rag.types import SourceError  # noqa: E402
 from services.ingest import file_source_id, ingest_file, ingest_url, url_source_id  # noqa: E402
 from services.summarizer import summarize  # noqa: E402
 from ui.styles import CSS, WELCOME  # noqa: E402
-from utils.helpers import export_chat_to_markdown, is_valid_url, md_escape, parse_url_list, safe_link  # noqa: E402
+from utils.helpers import export_chat_to_markdown, is_valid_url, md_code, md_escape, parse_url_list, safe_link  # noqa: E402
 from utils.logger import setup_logger  # noqa: E402
 
 logger = setup_logger("app")
@@ -124,6 +124,7 @@ def run_ingest(urls: List[str], files: List[Any]) -> None:
         embedder = None
         for kind, item in jobs:
             label = item if kind == "url" else item.name
+            shown = md_code(label) if kind == "url" else f"**{md_escape(label)}**"
             try:
                 if kind == "url":
                     if not is_valid_url(item):
@@ -131,7 +132,7 @@ def run_ingest(urls: List[str], files: List[Any]) -> None:
                     if kb.has_source(url_source_id(item)):
                         raise SourceError("Already in your knowledge base.")
                     kb.check_capacity()
-                    st.caption(f"Fetching {md_escape(label)}…")
+                    st.caption(f"Fetching {md_code(label)}…")
                     source, chunks = ingest_url(item, size, overlap)
                 else:
                     data = item.getvalue()
@@ -146,11 +147,11 @@ def run_ingest(urls: List[str], files: List[Any]) -> None:
                 st.markdown(f"✅ **{md_escape(source.title)}** · {len(chunks)} passage{'s' if len(chunks) != 1 else ''}")
             except SourceError as exc:
                 failed += 1
-                st.markdown(f"⚠️ **{md_escape(label)}** — {md_escape(exc)}")
+                st.markdown(f"⚠️ {shown} — {md_escape(exc)}")
             except Exception as exc:  # Never let one bad source crash the page.
                 failed += 1
                 logger.exception("Unexpected ingestion failure (%s).", type(exc).__name__)
-                st.markdown(f"⚠️ **{md_escape(label)}** — Unexpected error ({type(exc).__name__}).")
+                st.markdown(f"⚠️ {shown} — Unexpected error ({type(exc).__name__}).")
         if added and not failed:
             status.update(label=f"Added {added} source{'s' if added > 1 else ''}", state="complete", expanded=False)
         elif added:

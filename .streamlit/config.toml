@@ -1,5 +1,4 @@
 [server]
-fileWatcherType = "none"
 maxUploadSize = 25
 
 [browser]
