@@ -11,6 +11,7 @@ A lightweight, production-minded RAG assistant. Paste web links or upload PDFs, 
 - **Summaries**: overview, key points, takeaways and suggested follow-up questions for all sources or one.
 - **Source management**: web pages (HTML, plain text, or PDF links), PDF/.txt/.md uploads, duplicate detection, per-source removal.
 - **Export** a chat, with its cited sources, to Markdown.
+- **Resilient model calls**: transient Gemini errors (503/500) are retried with jitter, then the app falls back through a configurable list of models. Quota (429) and missing-model (404) errors move straight to the next model.
 
 ## Safe for many visitors
 
@@ -55,7 +56,8 @@ Get a free Gemini key at <https://aistudio.google.com/apikey>. The embedding mod
 
    ```toml
    GEMINI_API_KEY = "your-key"        # omit to make each visitor bring their own key
-   GEMINI_MODEL = "gemini-3.5-flash"  # any Gemini model your key can use
+   GEMINI_MODEL = "gemini-3.8-flash"  # any Gemini model your key can use
+   GEMINI_FALLBACK_MODELS = "gemini-3.6-flash,gemini-3.5-flash-lite"  # tried if the primary is overloaded
    ```
 
    If you set `GEMINI_API_KEY`, every visitor uses your key and quota. For a public demo, leaving it unset is usually the better choice.

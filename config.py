@@ -26,7 +26,12 @@ def _int_setting(name: str, default: int) -> int:
 
 
 # Models
-GEMINI_MODEL = get_setting("GEMINI_MODEL", "gemini-3.5-flash")
+GEMINI_MODEL = get_setting("GEMINI_MODEL", "gemini-3.8-flash")
+# Tried in order when the primary model is overloaded (503), out of quota (429) or unavailable (404).
+GEMINI_FALLBACK_MODELS = [
+    m.strip() for m in (get_setting("GEMINI_FALLBACK_MODELS", "gemini-3.6-flash,gemini-3.5-flash-lite") or "").split(",") if m.strip()
+]
+GEMINI_MODELS = list(dict.fromkeys([GEMINI_MODEL, *GEMINI_FALLBACK_MODELS]))
 EMBEDDING_MODEL = get_setting("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
 # bge models retrieve better when queries carry this instruction; passages are embedded as-is.
 QUERY_INSTRUCTION = "Represent this sentence for searching relevant passages: "
