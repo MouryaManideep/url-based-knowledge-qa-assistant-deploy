@@ -1,21 +1,42 @@
+"""Fetch public web pages with SSRF protections, TLS verification and size limits."""
+from __future__ import annotations
+
 import ipaddress
 import socket
-from typing import Any, Dict, Optional
+from dataclasses import dataclass
 from urllib.parse import urljoin, urlparse
 
 import requests
-from bs4 import BeautifulSoup
 
+from config import MAX_WEB_BYTES
+from rag.types import SourceError
 from utils.logger import setup_logger
 
 logger = setup_logger("web_loader")
-MAX_RESPONSE_BYTES = 5 * 1024 * 1024
+MAX_RESPONSE_BYTES = MAX_WEB_BYTES
 MAX_REDIRECTS = 5
 REDIRECT_STATUSES = {301, 302, 303, 307, 308}
+USER_AGENT = "Mozilla/5.0 (compatible; KnowledgeQA/2.0; +https://github.com/MouryaManideep)"
+
+CONTENT_KINDS = {
+    "text/html": "html",
+    "application/xhtml+xml": "html",
+    "text/plain": "text",
+    "text/markdown": "text",
+    "application/pdf": "pdf",
+}
+
+
+@dataclass
+class FetchedPage:
+    url: str
+    kind: str  # "html", "text" or "pdf"
+    body: bytes
+    encoding: str | None
 
 
 def _public_http_url(url: str) -> bool:
-    """Allow only HTTP(S) URLs resolving exclusively to public IP addresses."""
+    """Allow only HTTP(S) URLs whose host resolves exclusively to public IP addresses."""
     try:
         parsed = urlparse(url)
         scheme = parsed.scheme.lower()
@@ -35,19 +56,18 @@ def _public_http_url(url: str) -> bool:
             answers = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
             addresses = [ipaddress.ip_address(answer[4][0].split("%", 1)[0]) for answer in answers]
         return bool(addresses) and all(address.is_global for address in addresses)
-    except (ValueError, OSError, socket.gaierror):
+    except (ValueError, OSError):
         return False
 
 
-def load_url_content(url: str, timeout: int = 15) -> Optional[Dict[str, Any]]:
-    """Fetch a public HTML page with TLS verification and bounded redirects/body size."""
+def fetch_url(url: str, timeout: int = 15) -> FetchedPage:
+    """Download a public page. Raises SourceError with a user-facing reason on failure."""
     current_url = url
-    headers = {"User-Agent": "URLKnowledgeAssistant/1.0"}
+    headers = {"User-Agent": USER_AGENT, "Accept": "text/html,application/xhtml+xml,application/pdf,text/plain;q=0.9,*/*;q=0.5"}
     try:
         for redirect_count in range(MAX_REDIRECTS + 1):
             if not _public_http_url(current_url):
-                logger.warning("Blocked an invalid URL or a destination that is not publicly routable.")
-                return None
+                raise SourceError("This address is not a public web page.")
 
             with requests.get(
                 current_url,
@@ -59,37 +79,43 @@ def load_url_content(url: str, timeout: int = 15) -> Optional[Dict[str, Any]]:
             ) as response:
                 if response.status_code in REDIRECT_STATUSES:
                     if redirect_count >= MAX_REDIRECTS:
-                        logger.warning("Stopped webpage fetch after too many redirects.")
-                        return None
+                        raise SourceError("The page redirected too many times.")
                     location = response.headers.get("Location")
                     if not location:
-                        return None
+                        raise SourceError("The page sent an invalid redirect.")
                     current_url = urljoin(current_url, location)
                     continue
 
-                response.raise_for_status()
+                if response.status_code in (401, 403):
+                    raise SourceError("The site refused access (it may require a login or block bots).")
+                if response.status_code == 404:
+                    raise SourceError("Page not found (404).")
+                if response.status_code >= 400:
+                    raise SourceError(f"The site returned an error ({response.status_code}).")
+
                 content_type = response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
-                if content_type not in {"text/html", "application/xhtml+xml"}:
-                    logger.warning("Skipped webpage with unsupported content type.")
-                    return None
+                kind = CONTENT_KINDS.get(content_type)
+                if kind is None:
+                    raise SourceError(f"Unsupported content type ({content_type or 'unknown'}).")
                 declared_size = response.headers.get("Content-Length")
-                if declared_size and int(declared_size) > MAX_RESPONSE_BYTES:
-                    logger.warning("Skipped webpage larger than the configured size limit.")
-                    return None
+                if declared_size and declared_size.isdigit() and int(declared_size) > MAX_RESPONSE_BYTES:
+                    raise SourceError("The page is larger than the 5 MB limit.")
 
                 body = bytearray()
                 for chunk in response.iter_content(chunk_size=64 * 1024):
                     if chunk:
                         body.extend(chunk)
                         if len(body) > MAX_RESPONSE_BYTES:
-                            logger.warning("Stopped webpage download at the configured size limit.")
-                            return None
-                encoding = response.encoding or "utf-8"
-                html = bytes(body).decode(encoding, errors="replace")
-                soup = BeautifulSoup(html, "html.parser")
-                title = soup.title.get_text(" ", strip=True) if soup.title else current_url
-                return {"html": html, "title": title or current_url, "url": current_url}
-        return None
-    except (requests.exceptions.RequestException, UnicodeError, ValueError, OSError) as exc:
+                            raise SourceError("The page is larger than the 5 MB limit.")
+                # requests guesses ISO-8859-1 for text/* without a charset; only trust an explicit one.
+                has_charset = "charset=" in response.headers.get("Content-Type", "").lower()
+                encoding = response.encoding if has_charset else None
+                return FetchedPage(url=current_url, kind=kind, body=bytes(body), encoding=encoding)
+        raise SourceError("The page redirected too many times.")
+    except requests.exceptions.SSLError as exc:
+        raise SourceError("The site's TLS certificate could not be verified.") from exc
+    except requests.exceptions.Timeout as exc:
+        raise SourceError("The site took too long to respond.") from exc
+    except requests.exceptions.RequestException as exc:
         logger.warning("Could not fetch webpage (%s).", type(exc).__name__)
-        return None
+        raise SourceError("The site could not be reached.") from exc

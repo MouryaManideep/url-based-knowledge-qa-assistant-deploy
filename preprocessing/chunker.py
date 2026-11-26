@@ -1,75 +1,63 @@
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from typing import List, Dict, Any
-from langchain_core.documents import Document
+"""Recursive, overlap-aware text splitting (no LangChain dependency)."""
+from __future__ import annotations
 
-# File: preprocessing/chunker.py
-# Purpose: Split cleaned text into smaller chunks that can be stored in the vector database.
+import re
+from typing import List
 
-def _make_text_splitter(chunk_size: int, chunk_overlap: int) -> RecursiveCharacterTextSplitter:
-    if not isinstance(chunk_size, int) or chunk_size < 1:
-        raise ValueError("chunk_size must be a positive integer")
-    if not isinstance(chunk_overlap, int) or chunk_overlap < 0 or chunk_overlap >= chunk_size:
+SEPARATORS = ["\n\n", "\n", ". ", "? ", "! ", "; ", ", ", " "]
+
+
+def normalize_text(text: str) -> str:
+    text = text.replace("\r\n", "\n").replace("\r", "\n").replace(" ", " ")
+    text = re.sub(r"[ \t\f\v]+", " ", text)
+    text = re.sub(r" *\n *", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def _split_recursive(text: str, size: int, separators: List[str]) -> List[str]:
+    if len(text) <= size:
+        return [text]
+    for index, separator in enumerate(separators):
+        if separator in text:
+            parts = text.split(separator)
+            pieces = [part + separator for part in parts[:-1]] + [parts[-1]]
+            result: List[str] = []
+            for piece in pieces:
+                if not piece:
+                    continue
+                if len(piece) <= size:
+                    result.append(piece)
+                else:
+                    result.extend(_split_recursive(piece, size, separators[index + 1:]))
+            return result
+    return [text[i:i + size] for i in range(0, len(text), size)]
+
+
+def split_text(text: str, chunk_size: int = 1000, chunk_overlap: int = 150) -> List[str]:
+    """Split text into chunks of at most chunk_size characters, overlapping by up to chunk_overlap."""
+    if not isinstance(chunk_size, int) or chunk_size < 50:
+        raise ValueError("chunk_size must be an integer of at least 50")
+    if not isinstance(chunk_overlap, int) or not 0 <= chunk_overlap < chunk_size:
         raise ValueError("chunk_overlap must be a non-negative integer smaller than chunk_size")
-    return RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap, length_function=len)
 
+    text = normalize_text(text)
+    if not text:
+        return []
 
-def chunk_web_content(sections: List[Dict[str, Any]], url: str, title: str, chunk_size: int = 800, chunk_overlap: int = 150) -> List[Document]:
-    """
-    Chunks sections of web content, preserving source metadata (URL, title, heading).
-    """
-    text_splitter = _make_text_splitter(chunk_size, chunk_overlap)
-    
-    documents = []
-    for sec in sections:
-        text = str(sec.get("text", "")).strip()
-        heading = str(sec.get("heading", "Introduction"))
-        if not text:
-            continue
-        
-        # Split text into chunks
-        chunks = text_splitter.split_text(text)
-        for chunk in chunks:
-            doc = Document(
-                page_content=chunk,
-                metadata={
-                    "source": url,
-                    "title": title,
-                    "heading": heading,
-                    "type": "web",
-                    "page": ""
-                }
-            )
-            documents.append(doc)
-            
-    return documents
-
-def chunk_pdf_content(pages_data: List[Dict[str, Any]], chunk_size: int = 800, chunk_overlap: int = 150) -> List[Document]:
-    """
-    Chunks pages of PDF content, preserving page numbers and source metadata.
-    """
-    text_splitter = _make_text_splitter(chunk_size, chunk_overlap)
-    
-    documents = []
-    for page in pages_data:
-        text = str(page.get("text", "")).strip()
-        if not text:
-            continue
-        page_num = page.get("page_num", "")
-        source = page.get("source", "Unknown source")
-        title = page.get("title", "Uploaded PDF")
-        
-        chunks = text_splitter.split_text(text)
-        for chunk in chunks:
-            doc = Document(
-                page_content=chunk,
-                metadata={
-                    "source": source,
-                    "title": title,
-                    "heading": f"Page {page_num}",
-                    "type": "pdf",
-                    "page": page_num
-                }
-            )
-            documents.append(doc)
-            
-    return documents
+    pieces = _split_recursive(text, chunk_size, SEPARATORS)
+    chunks: List[str] = []
+    window: List[str] = []
+    length = 0
+    for piece in pieces:
+        if window and length + len(piece) > chunk_size:
+            chunks.append("".join(window).strip())
+            # Keep a tail of the previous chunk as overlap, as long as the new piece still fits.
+            while window and (length > chunk_overlap or length + len(piece) > chunk_size):
+                length -= len(window[0])
+                window.pop(0)
+        window.append(piece)
+        length += len(piece)
+    if window:
+        chunks.append("".join(window).strip())
+    return [chunk for chunk in chunks if chunk]

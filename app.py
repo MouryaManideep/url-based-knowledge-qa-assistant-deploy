@@ -1,429 +1,407 @@
-import os
-# Disable Streamlit file watcher for smoother local development in this project.
-os.environ["STREAMLIT_SERVER_FILE_WATCHER_TYPE"] = "none"
-os.environ["STREAMLIT_SERVER_ENABLE_FILE_WATCHER"] = "false"
+"""Knowledge QA — grounded answers from your web pages and documents.
+
+Every browser session gets its own in-memory knowledge base and its own API key slot,
+so the app is safe to host for many visitors at once.
+"""
+from __future__ import annotations
+
+import html
+from typing import Any, Dict, List
 
 import streamlit as st
 from dotenv import load_dotenv
-from typing import List, Dict, Any
 
-# File: app.py
-# Purpose: Main entry point for the Streamlit web app.
-# Flow: user provides URLs/PDFs -> content is processed -> embeddings are stored -> chat and summaries use the knowledge base.
-
-# Load environment variables such as the Gemini API key from a local .env file.
 load_dotenv()
 
-# Setup page configuration for the web interface.
-st.set_page_config(
-    page_title="URL-Based RAG QA Assistant",
-    layout="wide",
-    initial_sidebar_state="expanded"
+from config import (  # noqa: E402  (settings read .env, so load it first)
+    DEFAULT_CHUNK_OVERLAP,
+    DEFAULT_CHUNK_SIZE,
+    DEFAULT_MIN_RELEVANCE,
+    DEFAULT_TOP_K,
+    GEMINI_MODEL,
+    MAX_QUESTION_CHARS,
+    SAMPLE_URL,
+    get_setting,
+)
+from rag.embeddings import FastEmbedder  # noqa: E402
+from rag.index import KnowledgeBase  # noqa: E402
+from rag.llm import GeminiClient, LLMError  # noqa: E402
+from rag.prompts import NOT_FOUND  # noqa: E402
+from rag.qa import cited_numbers, hits_to_citations, is_not_found, retrieval_queries, sanitize_markdown, stream_answer  # noqa: E402
+from rag.types import SourceError  # noqa: E402
+from services.ingest import file_source_id, ingest_file, ingest_url, url_source_id  # noqa: E402
+from services.summarizer import summarize  # noqa: E402
+from ui.styles import CSS, WELCOME  # noqa: E402
+from utils.helpers import export_chat_to_markdown, is_valid_url, md_code, md_escape, parse_url_list, safe_link  # noqa: E402
+from utils.logger import setup_logger  # noqa: E402
+
+logger = setup_logger("app")
+SERVER_API_KEY = get_setting("GEMINI_API_KEY") or ""
+STARTER_QUESTIONS = [
+    "Summarize the main points.",
+    "What are the most important facts and figures?",
+    "What conclusions or recommendations are made?",
+]
+ICONS = {"web": "🌐", "pdf": "📄", "text": "📝"}
+
+st.set_page_config(page_title="Knowledge QA · Ask your sources", page_icon="📚", layout="wide", initial_sidebar_state="expanded")
+st.markdown(CSS, unsafe_allow_html=True)
+
+
+# --------------------------------------------------------------------------- state
+def init_state() -> None:
+    defaults: Dict[str, Any] = {
+        "kb": KnowledgeBase(),
+        "messages": [],
+        "summary": None,
+        "user_api_key": "",
+        "pending_question": None,
+        "pending_urls": [],
+        "view": "Chat",
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+
+init_state()
+kb: KnowledgeBase = st.session_state.kb
+
+
+@st.cache_resource(show_spinner=False)
+def get_embedder() -> FastEmbedder:
+    """One shared, stateless model per server process; documents stay per session."""
+    return FastEmbedder()
+
+
+def load_embedder() -> FastEmbedder:
+    try:
+        with st.spinner("Loading the embedding model (first run downloads about 70 MB)…"):
+            return get_embedder()
+    except Exception as exc:
+        logger.error("Embedding model failed to load (%s).", type(exc).__name__)
+        raise SourceError("The embedding model could not be loaded. Check the server's internet access and retry.") from exc
+
+
+def active_api_key() -> str:
+    return (st.session_state.user_api_key or "").strip() or SERVER_API_KEY
+
+
+# ----------------------------------------------------------------------- callbacks
+def ask(question: str) -> None:
+    st.session_state.pending_question = question
+    st.session_state.view = "Chat"
+
+
+def queue_sample() -> None:
+    st.session_state.pending_urls = [SAMPLE_URL]
+
+
+def remove_source(source_id: str) -> None:
+    kb.remove(source_id)
+    st.session_state.summary = None
+
+
+def clear_everything() -> None:
+    kb.clear()
+    st.session_state.messages = []
+    st.session_state.summary = None
+
+
+def clear_chat() -> None:
+    st.session_state.messages = []
+
+
+# ----------------------------------------------------------------------- ingestion
+def run_ingest(urls: List[str], files: List[Any]) -> None:
+    jobs = [("url", u) for u in urls] + [("file", f) for f in files]
+    if not jobs:
+        st.toast("Add a link or a file first.", icon="ℹ️")
+        return
+    size, overlap = st.session_state.chunk_size, st.session_state.chunk_overlap
+    added, failed = 0, 0
+    with st.status(f"Adding {len(jobs)} source{'s' if len(jobs) > 1 else ''}…", expanded=True) as status:
+        embedder = None
+        for kind, item in jobs:
+            label = item if kind == "url" else item.name
+            shown = md_code(label) if kind == "url" else f"**{md_escape(label)}**"
+            try:
+                if kind == "url":
+                    if not is_valid_url(item):
+                        raise SourceError("Not a valid http(s) link.")
+                    if kb.has_source(url_source_id(item)):
+                        raise SourceError("Already in your knowledge base.")
+                    kb.check_capacity()
+                    st.caption(f"Fetching {md_code(label)}…")
+                    source, chunks = ingest_url(item, size, overlap)
+                else:
+                    data = item.getvalue()
+                    if kb.has_source(file_source_id(data)):
+                        raise SourceError("Already in your knowledge base.")
+                    kb.check_capacity()
+                    source, chunks = ingest_file(item.name, data, size, overlap)
+                kb.check_capacity(len(chunks))
+                embedder = embedder or load_embedder()
+                bar = st.progress(0.0, text=f"Indexing {len(chunks)} passages…")
+                kb.add(source, chunks, embedder,
+                       progress=lambda done, total: bar.progress(done / total, text=f"Indexing passages {done:,}/{total:,}…"))
+                bar.empty()
+                added += 1
+                st.markdown(f"✅ **{md_escape(source.title)}** · {len(chunks)} passage{'s' if len(chunks) != 1 else ''}")
+            except SourceError as exc:
+                failed += 1
+                st.markdown(f"⚠️ {shown} — {md_escape(exc)}")
+            except Exception as exc:  # Never let one bad source crash the page.
+                failed += 1
+                logger.exception("Unexpected ingestion failure (%s).", type(exc).__name__)
+                st.markdown(f"⚠️ {shown} — Unexpected error ({type(exc).__name__}).")
+        if added and not failed:
+            status.update(label=f"Added {added} source{'s' if added > 1 else ''}", state="complete", expanded=False)
+        elif added:
+            status.update(label=f"Added {added}, skipped {failed}", state="complete", expanded=True)
+        else:
+            status.update(label="No sources were added", state="error", expanded=True)
+    if added:
+        st.session_state.summary = None
+
+
+# ------------------------------------------------------------------------- sidebar
+with st.sidebar:
+    st.markdown('<div class="brand">📚 Knowledge QA<small>Answers grounded in your sources</small></div>', unsafe_allow_html=True)
+
+    st.markdown("#### Gemini API key")
+    if SERVER_API_KEY:
+        st.caption("✅ This app has a key configured.")
+        with st.expander("Use my own key instead"):
+            st.text_input("Your Gemini API key", type="password", key="user_api_key", label_visibility="collapsed", placeholder="Paste your key")
+    else:
+        st.text_input("Your Gemini API key", type="password", key="user_api_key", label_visibility="collapsed", placeholder="Paste your key")
+        st.caption("Stored only for this browser session. [Get a free key ↗](https://aistudio.google.com/apikey)")
+
+    st.markdown("#### Add sources")
+    with st.form("add_sources", clear_on_submit=True, border=False):
+        urls_text = st.text_area("Web pages", placeholder="https://example.com/article\nOne link per line", height=96)
+        uploads = st.file_uploader("Files", type=["pdf", "txt", "md"], accept_multiple_files=True, help="PDF, .txt or .md, up to 25 MB each")
+        submitted = st.form_submit_button("Add to knowledge base", type="primary")
+
+    with st.expander("Answer & retrieval settings"):
+        st.toggle("Answer only from my sources", value=True, key="strict", help="Off: the assistant may add clearly labelled general knowledge.")
+        st.slider("Passages per answer", 3, 12, DEFAULT_TOP_K, key="top_k")
+        st.slider("Minimum relevance", 0.0, 0.8, DEFAULT_MIN_RELEVANCE, 0.05, key="min_relevance",
+                  help="Passages with lower semantic similarity are ignored unless they match your keywords.")
+        st.toggle("Diversify passages", value=False, key="diversify", help="Maximal marginal relevance: fewer near-duplicate passages.")
+        st.select_slider("Chunk size (characters)", options=[500, 750, 1000, 1500, 2000], value=DEFAULT_CHUNK_SIZE, key="chunk_size")
+        st.select_slider("Chunk overlap", options=[0, 100, 150, 200, 300], value=DEFAULT_CHUNK_OVERLAP, key="chunk_overlap")
+        st.caption("Chunk settings apply to sources you add next.")
+
+    pending_urls = st.session_state.pending_urls
+    st.session_state.pending_urls = []
+    if submitted or pending_urls:
+        run_ingest(parse_url_list(urls_text) + pending_urls if submitted else pending_urls, list(uploads or []) if submitted else [])
+
+    st.divider()
+    st.caption("🔒 Your sources and chat live only in this browser session's memory and are never shared with other visitors. "
+               "Question text and retrieved passages are sent to Google Gemini to write answers.")
+
+
+# -------------------------------------------------------------------------- header
+st.markdown(
+    f"""<div class="hero"><div><h1>Ask your sources</h1>
+<p>Grounded answers from web pages and documents, with citations you can check.</p></div>
+<div class="stats"><span><b>{len(kb.sources)}</b> sources</span><span><b>{len(kb):,}</b> passages</span>
+<span>{html.escape(GEMINI_MODEL)}</span></div></div>""",
+    unsafe_allow_html=True,
 )
 
-# Custom premium styling
-st.markdown("""
-<style>
-    /* Dark glassmorphic headers and backgrounds */
-    .main .block-container {
-        padding-top: 2rem;
-        padding-bottom: 2rem;
-    }
-    
-    h1 {
-        font-family: 'Outfit', 'Inter', sans-serif;
-        font-weight: 800;
-        background: linear-gradient(135deg, #FF6B6B 0%, #4D96FF 100%);
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
-        margin-bottom: 1.5rem;
-    }
-    
-    .stButton>button {
-        border-radius: 8px;
-        background: linear-gradient(135deg, #4D96FF 0%, #3B82F6 100%);
-        color: white;
-        border: none;
-        padding: 0.5rem 1rem;
-        font-weight: 600;
-        transition: all 0.3s ease;
-    }
-    
-    .stButton>button:hover {
-        background: linear-gradient(135deg, #3B82F6 0%, #1D4ED8 100%);
-        box-shadow: 0 4px 15px rgba(59, 130, 246, 0.4);
-        transform: translateY(-1px);
-    }
-    
-    .citation-card {
-        padding: 10px;
-        border-radius: 8px;
-        background-color: #f0f4f8;
-        border-left: 4px solid #4D96FF;
-        margin-bottom: 8px;
-        font-size: 0.85rem;
-    }
-    
-    .dark .citation-card {
-        background-color: #1e293b;
-        border-left: 4px solid #3b82f6;
-    }
-</style>
-""", unsafe_allow_html=True)
-
-from loaders.web_loader import load_url_content
-from loaders.pdf_loader import load_pdf_content
-from preprocessing.cleaner import clean_html
-from preprocessing.chunker import chunk_web_content, chunk_pdf_content
-from vectorstore.faiss_store import INDEX_DIR, get_faiss_index, clear_faiss_index
-from rag.qa_chain import generate_answer
-from services.summarizer import get_summaries
-from utils.helpers import is_valid_url, export_chat_to_markdown, content_fingerprint
+view = st.radio(
+    "View", ["Chat", "Summary", "Sources"], horizontal=True, key="view", label_visibility="collapsed",
+    format_func=lambda v: {"Chat": "💬 Chat", "Summary": "📝 Summary", "Sources": f"📚 Sources ({len(kb.sources)})"}[v],
+)
 
 
-def render_citations(citations):
-    """Render untrusted source metadata as plain text and only link HTTP(S) URLs."""
-    for cite in citations:
-        title = str(cite.get("title") or "Untitled source")
-        heading = str(cite.get("heading") or "Unlabelled section")
-        page = cite.get("page")
-        page_text = f", page {page}" if page else ""
-        with st.container():
-            st.text(f"{title} — {heading}{page_text}")
-            score = cite.get("semantic_similarity")
-            if isinstance(score, (int, float)):
-                st.caption(f"Semantic match: {score:.0%}")
-            source = str(cite.get("source") or "Unknown source")
-            if is_valid_url(source):
-                st.link_button("Open source", source)
-            else:
-                st.caption(f"Source: {source}")
+# ---------------------------------------------------------------------------- chat
+def render_citations(message: Dict[str, Any]) -> None:
+    citations = message.get("citations") or []
+    if not citations:
+        return
+    cited = set(message.get("cited") or [])
+    shown = [c for c in citations if c["n"] in cited] or citations
+    with st.expander(f"Sources · {len(shown)}"):
+        for cite in shown:
+            with st.container(border=True):
+                title = f"**[{cite['n']}] {md_escape(cite['title'])}**"
+                url = cite.get("url")
+                if url and is_valid_url(url):
+                    title += f" · [Open ↗]({safe_link(url)})"
+                st.markdown(title)
+                meta = [md_escape(cite["location"])] if cite.get("location") else []
+                meta.append(f"{cite['relevance']:.0%} semantic match")
+                if cite.get("keyword"):
+                    meta.append("keyword match")
+                st.caption(" · ".join(meta))
+                snippet = cite.get("snippet") or ""
+                st.caption(md_escape(snippet[:320] + ("…" if len(snippet) > 320 else "")))
 
 
-# Initialize session state so information stays available across Streamlit reruns.
-# This helps the app remember chat history, processed sources, and the FAISS database.
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
-if "processed_urls" not in st.session_state:
-    st.session_state.processed_urls = set()
-if "processed_files" not in st.session_state:
-    st.session_state.processed_files = {}
-if "db" not in st.session_state:
-    # Try loading an existing FAISS index from disk when the app starts.
-    st.session_state.db = get_faiss_index()
+def render_model_note(message: Dict[str, Any]) -> None:
+    model = message.get("model")
+    if model and model != GEMINI_MODEL:
+        st.caption(f"Answered by {md_code(model)} because {md_code(GEMINI_MODEL)} was busy.")
 
-# Header: App overview
-# Description: This app lets users add websites and PDFs, build a searchable knowledge base, and ask questions about the loaded content.
 
-# Main page title shown at the top of the app.
-st.title("URL-Based Intelligent QA Assistant")
+def answer(question: str) -> None:
+    question = question.strip()[:MAX_QUESTION_CHARS]
+    if not question:
+        return
+    messages: List[Dict[str, Any]] = st.session_state.messages
+    history = [m for m in messages if not m.get("error")]
+    with st.chat_message("user"):
+        st.markdown(question)
+    messages.append({"role": "user", "content": question})
 
-# Header: Sidebar controls
-# Description: Collects API keys, search settings, URLs, PDFs, and build actions.
-with st.sidebar:
-    st.header("⚙️ Configuration")
-    if st.session_state.db is None and os.path.exists(os.path.join(INDEX_DIR, "index.pkl")) and not os.path.exists(os.path.join(INDEX_DIR, "store.json")):
-        st.warning("This local index uses an older pickle format and was not loaded for safety. Clear it, then re-add your sources.")
-    
-    # API Key Input
-    api_key_input = st.text_input(
-        "Gemini API Key",
-        value=os.getenv("GEMINI_API_KEY", ""),
-        type="password",
-        help="If you don't have it set in your .env file, enter it here."
-    )
-    if api_key_input:
-        os.environ["GEMINI_API_KEY"] = api_key_input
-
-    # Strict Source Mode Checkbox
-    strict_mode = st.checkbox(
-        "Strict Source Mode",
-        value=True,
-        help="When checked, the assistant only answers using the provided sources. When unchecked, it will fall back to general knowledge if the answer isn't in the sources."
-    )
-        
-    st.markdown("---")
-    
-    # Dynamic settings for RAG and LLM
-    st.subheader("🤖 Model & RAG Settings")
-    temperature = st.slider("Temperature", min_value=0.0, max_value=1.0, value=0.1, step=0.05, help="Lower value is more deterministic, higher is more creative.")
-    search_type = st.selectbox(
-        "Semantic Search Strategy",
-        options=["semantic_similarity", "mmr"],
-        index=0,
-        format_func=lambda x: "Semantic Similarity" if x == "semantic_similarity" else "Semantic MMR (diverse results)",
-        help="Both options search embeddings, not exact keywords. MMR favors a diverse set of relevant passages.",
-    )
-    top_k = st.slider("Retrieval Chunk Count (K)", min_value=1, max_value=15, value=5, step=1)
-    min_similarity = st.slider(
-        "Minimum semantic similarity",
-        min_value=0.0,
-        max_value=0.8,
-        value=0.20,
-        step=0.05,
-        help="Passages below this cosine-similarity estimate are ignored. Raise it to be stricter; lower it to retrieve broader matches.",
-    )
-    
-    st.subheader("✂️ Chunking Parameters")
-    chunk_size = st.slider("Chunk Size (characters)", min_value=200, max_value=2000, value=800, step=100)
-    chunk_overlap = st.slider(
-        "Chunk Overlap (characters)",
-        min_value=0,
-        max_value=min(500, chunk_size - 1),
-        value=min(150, chunk_size - 1),
-        step=50,
-        help="Overlap preserves context between adjacent chunks and must remain smaller than the chunk size.",
-    )
-
-    st.markdown("---")
-    
-    # Input URLs
-    st.subheader("🌐 Web Sources")
-    urls_input = st.text_area(
-        "Enter URLs (one per line)",
-        placeholder="https://example.com\nhttps://another-page.com"
-    )
-    
-    st.markdown("---")
-    
-    # Upload PDFs
-    st.subheader("📄 PDF Documents")
-    uploaded_files = st.file_uploader(
-        "Upload PDF files",
-        type=["pdf"],
-        accept_multiple_files=True
-    )
-    
-    # Build Knowledge Base Action
-    build_db = st.button("Build Knowledge Base . . . . ")
-    
-    # Clear index action
-    if st.button("Clear Database . . . . "):
+    with st.chat_message("assistant"):
+        reply: Dict[str, Any] = {"role": "assistant", "content": "", "citations": [], "cited": []}
+        api_key = active_api_key()
+        if not api_key:
+            reply.update(content="Add a Gemini API key in the sidebar to get answers.", error=True)
+            st.markdown(reply["content"])
+            messages.append(reply)
+            return
         try:
-            clear_faiss_index()
-            st.session_state.db = None
-            st.session_state.processed_urls.clear()
-            st.session_state.processed_files.clear()
-            st.session_state.chat_history.clear()
-            st.success("Database cleared!")
-            st.rerun()
-        except OSError as exc:
-            st.error(f"Could not completely clear the local database ({type(exc).__name__}).")
+            with st.spinner("Searching your sources…"):
+                hits = kb.search(
+                    retrieval_queries(question, history), load_embedder(),
+                    k=st.session_state.top_k, min_relevance=st.session_state.min_relevance, diversify=st.session_state.diversify,
+                )
+        except SourceError as exc:
+            reply.update(content=f"⚠️ {exc}", error=True)
+            st.markdown(reply["content"])
+            messages.append(reply)
+            return
 
-# Header: Build knowledge base
-# Description: Process the entered URLs and uploaded PDFs into searchable chunks.
-if build_db:
-    # Split the multiline URL text into a clean list of links.
-    urls = [u.strip() for u in urls_input.split("\n") if u.strip()]
-    invalid_urls = [u for u in urls if not is_valid_url(u)]
-    valid_urls = [u for u in urls if is_valid_url(u)]
-    
-    if invalid_urls:
-        st.sidebar.warning(f"Skipped invalid URLs: {', '.join(invalid_urls)}")
-        
-    all_documents = []
-    pending_urls = []
-    pending_files = {}
-    ingestion_errors = []
-    
-    # Process Web URLs
-    if valid_urls:
-        with st.spinner("Processing Web URLs..."):
-            for url in valid_urls:
-                if url in st.session_state.processed_urls:
-                    continue
-                try:
-                    content = load_url_content(url)
-                    if content:
-                        sections = clean_html(content["html"])
-                        chunks = chunk_web_content(sections, url=content["url"], title=content["title"], chunk_size=chunk_size, chunk_overlap=chunk_overlap)
-                        if chunks:
-                            all_documents.extend(chunks)
-                            pending_urls.append(url)
-                        else:
-                            ingestion_errors.append(f"No readable text found at {url}")
-                    else:
-                        ingestion_errors.append(f"Could not load {url}")
-                except Exception as exc:
-                    ingestion_errors.append(f"Could not process {url} ({type(exc).__name__})")
-                    
-    # Process Uploaded PDFs
-    if uploaded_files:
-        with st.spinner("Processing PDF Documents..."):
-            for uploaded_file in uploaded_files:
-                file_bytes = uploaded_file.getvalue()
-                file_hash = content_fingerprint(file_bytes)
-                if file_hash in st.session_state.processed_files:
-                    continue
-                # Load PDF from bytes
-                try:
-                    pages_data = load_pdf_content(file_bytes, uploaded_file.name)
-                    chunks = chunk_pdf_content(pages_data, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
-                    if chunks:
-                        all_documents.extend(chunks)
-                        pending_files[file_hash] = uploaded_file.name
-                    else:
-                        ingestion_errors.append(f"No extractable text found in {uploaded_file.name}")
-                except Exception as exc:
-                    ingestion_errors.append(f"Could not process {uploaded_file.name} ({type(exc).__name__})")
-                
-    if all_documents:
+        strict = st.session_state.strict
+        if not hits and strict:
+            reply["content"] = (f"{NOT_FOUND}\n\nTry rephrasing, lowering **Minimum relevance** in the settings, "
+                                "or adding a source that covers this topic.")
+            st.markdown(reply["content"])
+            messages.append(reply)
+            return
+
+        placeholder = st.empty()
+        placeholder.markdown("_Thinking…_")
+        buffer = ""
         try:
-            with st.spinner("Generating embeddings & updating FAISS index..."):
-                db = get_faiss_index(all_documents)
-            if db is None:
-                raise RuntimeError("index update returned no database")
-            st.session_state.db = db
-            st.session_state.processed_urls.update(pending_urls)
-            st.session_state.processed_files.update(pending_files)
-            st.sidebar.success(f"Successfully processed {len(all_documents)} new chunks!")
-            if ingestion_errors:
-                st.sidebar.warning("Some sources were skipped. Check the source list and try those files/URLs again.")
-            st.rerun()
-        except Exception as exc:
-            st.sidebar.error(f"The knowledge base was not updated ({type(exc).__name__}). Your sources remain eligible for retry.")
-    else:
-        if ingestion_errors:
-            st.sidebar.warning("No new documents were indexed. One or more sources could not be read; correct them and retry.")
-        else:
-            st.sidebar.info("No new documents or URLs were added.")
+            llm = GeminiClient(api_key, GEMINI_MODEL, on_event=lambda message: placeholder.markdown(f"_{message}_"))
+            for delta in stream_answer(llm, question, hits, history, strict=strict):
+                buffer += delta
+                placeholder.markdown(sanitize_markdown(buffer) + " ▌")
+            text = sanitize_markdown(buffer).strip() or "The model returned an empty response. Please try again."
+            reply.update(content=text, citations=[] if is_not_found(text) else hits_to_citations(hits),
+                         cited=sorted(cited_numbers(text, len(hits))), model=llm.last_model)
+        except LLMError as exc:
+            reply.update(content=f"⚠️ {exc}", error=True)
+        placeholder.markdown(reply["content"])
+        render_model_note(reply)
+        render_citations(reply)
+        messages.append(reply)
 
-# Header: Main content tabs
-# Description: Organize the app into source viewing, summaries, and chat.
-tab_chat, tab_summary, tab_sources = st.tabs(["💬 Chat Assistant", "📝 Summarization", "📚 Active Sources"])
 
-# Header: Active sources view
-with tab_sources:
-    st.subheader("Currently Loaded Sources")
-    
-    if st.session_state.db:
-        try:
-            chunk_count = len(st.session_state.db.docstore._dict)
-            st.info(f"📊 **Database Stats**: Currently storing **{chunk_count} chunks** in local FAISS vector store.")
-        except Exception:
-            st.info("📊 **Database Stats**: Chunks successfully stored in vector database.")
-    else:
-        st.info("📊 **Database Stats**: Vector database is currently empty.")
-        
-    col1, col2 = st.columns(2)
-    with col1:
-        st.markdown("**Webpages:**")
-        if st.session_state.processed_urls:
-            for url in st.session_state.processed_urls:
-                st.text(url)
-                if is_valid_url(url):
-                    st.link_button("Open webpage", url, key=f"source-{content_fingerprint(url.encode())[:12]}")
-        else:
-            st.info("No webpages loaded.")
-    with col2:
-        st.markdown("**PDF Documents:**")
-        if st.session_state.processed_files:
-            for filename in st.session_state.processed_files.values():
-                st.text(f"PDF: {filename}")
-        else:
-            st.info("No PDF files uploaded.")
+def render_chat() -> None:
+    messages = st.session_state.messages
+    if kb.is_empty and not messages:
+        st.markdown(WELCOME, unsafe_allow_html=True)
+        left, mid, right = st.columns([1, 1.2, 1])
+        mid.button("✨ Try it with a sample page", on_click=queue_sample, type="primary")
+        st.caption("The sample loads the Wikipedia article on retrieval-augmented generation.", help=SAMPLE_URL)
 
-# Header: Summary view
-with tab_summary:
-    st.subheader("Source Material Summary")
-    if not st.session_state.db:
-        st.warning("Please build the knowledge base first to generate summaries.")
-    else:
-        if st.button("⚡ Generate Summaries"):
-            with st.spinner("Analyzing sources and generating summaries..."):
-                summaries = get_summaries(st.session_state.db, temperature=temperature)
-            if summaries.get("error"):
-                st.error(summaries["error"])
-            else:
-                if summaries.get("coverage"):
-                    st.caption(summaries["coverage"])
-                st.markdown("### 📊 Executive Summary")
-                st.write(summaries["executive"])
-                st.markdown("---")
-                st.markdown("### 📌 Key Points")
-                st.write(summaries["bullets"])
-                st.markdown("---")
-                st.markdown("### 💡 Takeaways")
-                st.write(summaries["takeaways"])
-
-# Header: Chat view
-with tab_chat:
-    # Display chat messages from history
-    for message in st.session_state.chat_history:
+    for message in messages:
         with st.chat_message(message["role"]):
-                st.markdown(message["content"])
-                if "citations" in message and message["citations"]:
-                    with st.expander("🔍 Show Source Citations"):
-                        render_citations(message["citations"])
+            st.markdown(message["content"])
+            if message["role"] == "assistant":
+                render_model_note(message)
+                render_citations(message)
 
-    # Chat input
-    if question := st.chat_input("Ask a question about the provided sources..."):
-        if not os.getenv("GEMINI_API_KEY"):
-            st.error("Please enter a Gemini API Key in the sidebar or check your .env configuration.")
-        elif not st.session_state.db:
-            st.warning("Please populate the knowledge base first by adding URLs or PDFs.")
+    if not messages and not kb.is_empty:
+        st.markdown("##### Try asking")
+        cols = st.columns(len(STARTER_QUESTIONS))
+        for col, starter in zip(cols, STARTER_QUESTIONS):
+            col.button(starter, on_click=ask, args=(starter,))
+
+    typed = st.chat_input(
+        "Ask a question about your sources…" if not kb.is_empty else "Add a source to start asking questions",
+        disabled=kb.is_empty, max_chars=MAX_QUESTION_CHARS,
+    )
+    question = typed or st.session_state.pending_question
+    st.session_state.pending_question = None
+    if question and not kb.is_empty:
+        answer(question)
+
+    if st.session_state.messages:
+        st.write("")
+        c1, c2, _ = st.columns([1, 1, 3])
+        c1.download_button("⬇️ Export chat", export_chat_to_markdown(st.session_state.messages),
+                           file_name="chat.md", mime="text/markdown")
+        c2.button("🗑️ Clear chat", on_click=clear_chat)
+
+
+# ------------------------------------------------------------------------- summary
+def render_summary() -> None:
+    if kb.is_empty:
+        st.info("Add a source to generate a summary.")
+        return
+    options = [None] + list(kb.sources)
+    if st.session_state.get("summary_scope") not in options:
+        st.session_state.summary_scope = None
+    c1, c2 = st.columns([3, 1], vertical_alignment="bottom")
+    scope = c1.selectbox("Summarize", options, key="summary_scope",
+                         format_func=lambda s: "All sources" if s is None else kb.sources[s].title)
+    if c2.button("Generate summary", type="primary"):
+        api_key = active_api_key()
+        if not api_key:
+            st.warning("Add a Gemini API key in the sidebar first.")
         else:
-            # Display user message
-            with st.chat_message("user"):
-                st.markdown(question)
-            
-            # Add to history
-            st.session_state.chat_history.append({"role": "user", "content": question})
-            
-            # Generate response
-            with st.chat_message("assistant"):
-                message_placeholder = st.empty()
-                with st.spinner("Searching knowledge base and thinking..."):
-                    try:
-                        answer, retrieved_docs = generate_answer(
-                            question=question,
-                            db=st.session_state.db,
-                            chat_history=st.session_state.chat_history[:-1], # Exclude current question
-                            strict=strict_mode,
-                            k=top_k,
-                            temperature=temperature,
-                            search_type=search_type,
-                            min_similarity=min_similarity,
-                        )
-                    except Exception as exc:
-                        answer, retrieved_docs = f"I couldn't complete that request ({type(exc).__name__}). Please try again.", []
-                    
-                    message_placeholder.markdown(answer)
-                    
-                    # Extract unique citations
-                    citations = []
-                    seen_citations = set()
-                    for doc in retrieved_docs:
-                        key = (doc.metadata.get("source"), doc.metadata.get("title"), doc.metadata.get("heading"), doc.metadata.get("page"))
-                        if key not in seen_citations:
-                            seen_citations.add(key)
-                            citations.append({
-                                    "title": doc.metadata.get("title"),
-                                "heading": doc.metadata.get("heading"),
-                                "page": doc.metadata.get("page"),
-                                "source": doc.metadata.get("source"),
-                                "semantic_similarity": doc.metadata.get("semantic_similarity"),
-                            })
-                            
-                    # Show citations below answer
-                    if citations:
-                        with st.expander("🔍 Show Source Citations"):
-                            render_citations(citations)
-                                
-            # Add assistant message to history
-            st.session_state.chat_history.append({
-                "role": "assistant",
-                "content": answer,
-                "citations": citations
-            })
+            with st.status("Reading your sources…", expanded=True) as status:
+                try:
+                    llm = GeminiClient(api_key, GEMINI_MODEL, on_event=lambda message: st.caption(message))
+                    result = summarize(llm, kb, scope)
+                    st.session_state.summary = {"scope": scope, "model": llm.last_model, **result}
+                    status.update(label="Summary ready", state="complete", expanded=False)
+                except LLMError as exc:
+                    status.update(label="The summary couldn't be generated", state="error", expanded=True)
+                    st.error(str(exc))
 
-    # Export & download options
-    if st.session_state.chat_history:
-        st.markdown("---")
-        md_export = export_chat_to_markdown(st.session_state.chat_history)
-        st.download_button(
-            label="📥 Export Chat History to Markdown",
-            data=md_export,
-            file_name="chat_history.md",
-            mime="text/markdown"
-        )
+    summary = st.session_state.summary
+    if not summary or summary.get("scope") != scope:
+        return
+    with st.container(border=True):
+        st.markdown("#### Overview")
+        st.markdown(summary["overview"])
+        st.markdown("#### Key points")
+        st.markdown("\n".join(f"- {p}" for p in summary["key_points"]))
+        if summary.get("takeaways"):
+            st.markdown("#### Takeaways")
+            st.markdown("\n".join(f"- {t}" for t in summary["takeaways"]))
+        st.caption(summary["coverage"] + (f" Written by {summary['model']}." if summary.get("model") else ""))
+    if summary.get("questions"):
+        st.markdown("##### Explore further")
+        for i, q in enumerate(summary["questions"]):
+            st.button(f"💬 {q}", key=f"suggest-{i}", on_click=ask, args=(q,))
+
+
+# ------------------------------------------------------------------------- sources
+def render_sources() -> None:
+    if kb.is_empty:
+        st.info("No sources yet. Add web pages or files from the sidebar.")
+        return
+    for source in sorted(kb.sources.values(), key=lambda s: s.added_at):
+        with st.container(border=True):
+            c1, c2 = st.columns([5, 1], vertical_alignment="center")
+            c1.markdown(f"{ICONS.get(source.kind, '📄')} **{md_escape(source.title)}**")
+            origin = f"[{md_escape(source.origin)}]({safe_link(source.origin)})" if is_valid_url(source.origin) else md_escape(source.origin)
+            c1.caption(f"{origin} · {source.chunk_count} passages · {source.char_count:,} characters")
+            c2.button("Remove", key=f"rm-{source.id}", on_click=remove_source, args=(source.id,))
+    st.caption(f"{len(kb.sources)} of {kb.max_sources} sources · {len(kb):,} of {kb.max_chunks:,} passages used this session")
+    st.button("Remove all sources and chat", on_click=clear_everything)
+
+
+{"Chat": render_chat, "Summary": render_summary, "Sources": render_sources}[view]()

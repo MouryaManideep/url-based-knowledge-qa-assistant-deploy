@@ -11,8 +11,7 @@ venv/
 .venv/
 env/
 
-# Generated local vector index / model data
-faiss_index/
-*.faiss
-*.idx
+# Streamlit secrets and local model cache
+.streamlit/secrets.toml
 .DS_Store
+local_cache/
