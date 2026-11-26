@@ -16,6 +16,16 @@ logger = setup_logger("llm")
 TRANSIENT_CODES = {500, 502, 503, 504}
 # Quota, missing model, or still overloaded after a retry: move on to the next model.
 FALLBACK_CODES = TRANSIENT_CODES | {429, 404}
+REQUEST_TIMEOUT_S = 90  # One Gemini request; without this a stuck call can hang forever.
+TOTAL_BUDGET_S = 150  # Retries and fallbacks together never keep a user waiting longer.
+COOLDOWN_S = 60  # A model that just reported overload/quota is skipped for this long.
+
+# Process-wide: if Gemini says a model is overloaded, every session benefits from skipping it.
+_cooldowns: Dict[str, float] = {}
+
+
+def reset_cooldowns() -> None:
+    _cooldowns.clear()
 
 
 class LLMError(Exception):
@@ -25,9 +35,13 @@ class LLMError(Exception):
 def error_code(exc: Exception) -> Optional[int]:
     code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
     try:
-        return int(code) if code is not None else None
+        if code is not None:
+            return int(code)
     except (TypeError, ValueError):
-        return None
+        pass
+    if isinstance(exc, TimeoutError) or "timeout" in type(exc).__name__.lower():
+        return 504  # A timed-out request is treated like a gateway timeout: retry or fall back.
+    return None
 
 
 def friendly_error(exc: Optional[Exception]) -> str:
@@ -42,7 +56,7 @@ def friendly_error(exc: Optional[Exception]) -> str:
     if code == 404 or "not found" in text:
         return "The configured Gemini models are not available for this key. Set GEMINI_MODEL to a model you can use."
     if code in TRANSIENT_CODES or "unavailable" in text or "overloaded" in text:
-        return "Gemini is temporarily overloaded (fallback models too). Please try again in a minute."
+        return "Gemini is temporarily overloaded or slow (fallback models too). Please try again in a minute."
     if "safety" in text or "blocked" in text:
         return "Gemini declined to answer this request."
     return "The model request failed. Please try again."
@@ -60,6 +74,9 @@ class GeminiClient:
         models: Union[str, Sequence[str]],
         client: Optional[Any] = None,
         sleep: Callable[[float], None] = time.sleep,
+        on_event: Optional[Callable[[str], None]] = None,
+        clock: Callable[[], float] = time.monotonic,
+        budget_s: float = TOTAL_BUDGET_S,
     ):
         if not api_key:
             raise LLMError("Add a Gemini API key in the sidebar to ask questions.")
@@ -71,10 +88,13 @@ class GeminiClient:
         if not self.models:
             raise LLMError("No Gemini model is configured.")
         self._sleep = sleep
+        self._clock = clock
+        self._budget_s = budget_s
+        self._on_event = on_event or (lambda message: None)
         if client is None:
             from google import genai  # Lazy import keeps startup fast.
 
-            client = genai.Client(api_key=api_key)
+            client = genai.Client(api_key=api_key, http_options={"timeout": REQUEST_TIMEOUT_S * 1000})
         self._client = client
         self.last_model: Optional[str] = None
 
@@ -83,10 +103,42 @@ class GeminiClient:
         return self.models[0]
 
     def _attempts(self):
-        """Yield (model, attempt) pairs: each model gets one retry for transient errors."""
-        for model in self.models:
+        """Yield (model, attempt) pairs: each model gets one retry for transient errors.
+
+        Models cooling down after a recent overload go last instead of first, and the whole
+        sequence stops once the time budget is spent."""
+        now = self._clock()
+        ready = [m for m in self.models if _cooldowns.get(m, 0) <= now]
+        cooling = [m for m in self.models if m not in ready]
+        order = ready + cooling
+        start = now
+        for index, model in enumerate(order):
+            if index:
+                self._on_event(f"Trying {model}…")
+            elif model in cooling:
+                self._on_event(f"All models were busy recently; trying {model}…")
+            else:
+                self._on_event(f"Asking {model}…")
             for attempt in range(2):
+                if self._clock() - start > self._budget_s:
+                    raise LLMError("Gemini is taking too long to respond right now. Please try again in a minute.")
                 yield model, attempt
+
+    def _note_failure(self, model: str, exc: Exception, attempt: int) -> str:
+        _log_failure(model, exc)
+        decision = self._should_retry(exc, attempt)
+        code = error_code(exc)
+        if decision == "retry":
+            self._on_event(f"{model} is busy, retrying…" if code != 504 else f"{model} timed out, retrying…")
+        elif decision == "next":
+            if code in TRANSIENT_CODES or code == 429:
+                _cooldowns[model] = self._clock() + COOLDOWN_S
+            self._on_event(f"{model} is busy right now." if code != 504 else f"{model} timed out.")
+        return decision
+
+    def _succeeded(self, model: str) -> None:
+        _cooldowns.pop(model, None)
+        self.last_model = model
 
     def _should_retry(self, exc: Exception, attempt: int) -> str:
         """Return 'retry' (same model), 'next' (next model) or 'raise'."""
@@ -112,16 +164,17 @@ class GeminiClient:
                 for chunk in response:
                     text = getattr(chunk, "text", None)
                     if text:
-                        started = True
-                        self.last_model = model
+                        if not started:
+                            started = True
+                            self._succeeded(model)
                         yield text
                 return
             except Exception as exc:
-                _log_failure(model, exc)
                 last_exc = exc
                 if started:  # Can't transparently restart an answer the user is already reading.
+                    _log_failure(model, exc)
                     raise LLMError("The answer was interrupted by a Gemini error. Please ask again.") from exc
-                decision = self._should_retry(exc, attempt)
+                decision = self._note_failure(model, exc, attempt)
                 if decision == "raise":
                     raise LLMError(friendly_error(exc)) from exc
                 if decision == "retry":
@@ -142,14 +195,13 @@ class GeminiClient:
                     contents=[{"role": "user", "parts": [{"text": prompt}]}],
                     config={"system_instruction": system, "response_mime_type": "application/json"},
                 )
-                self.last_model = model
+                self._succeeded(model)
                 return parse_json_object(getattr(response, "text", "") or "")
             except LLMError:
                 raise
             except Exception as exc:
-                _log_failure(model, exc)
                 last_exc = exc
-                decision = self._should_retry(exc, attempt)
+                decision = self._note_failure(model, exc, attempt)
                 if decision == "raise":
                     raise LLMError(friendly_error(exc)) from exc
                 if decision == "retry":

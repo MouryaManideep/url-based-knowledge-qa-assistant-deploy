@@ -66,6 +66,13 @@ class KnowledgeBaseTests(unittest.TestCase):
         self.assertEqual(second.search(["llama"], emb), [])
         self.assertFalse(first.is_empty)
 
+    def test_add_reports_embedding_progress(self):
+        kb, emb, seen = KnowledgeBase(), HashingEmbedder(), []
+        chunks = [Chunk(f"passage {i}", "big", "Big") for i in range(150)]
+        kb.add(Source("big", "Big", "pdf", "big.pdf"), chunks, emb, progress=lambda done, total: seen.append((done, total)))
+        self.assertEqual(seen, [(64, 150), (128, 150), (150, 150)])
+        self.assertEqual(len(kb), 150)
+
     def test_diversify_returns_k_distinct(self):
         kb, emb = build()
         hits = kb.search(["llama"], emb, k=2, min_relevance=0.0, diversify=True)

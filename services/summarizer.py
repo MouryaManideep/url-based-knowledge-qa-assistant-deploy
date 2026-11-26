@@ -9,7 +9,8 @@ from rag.prompts import SUMMARY_SYSTEM
 from rag.qa import sanitize_markdown
 from rag.types import Chunk
 
-MAX_SUMMARY_CHARS = 60_000
+# Enough for a representative sample; larger prompts are slower and fail more often under load.
+MAX_SUMMARY_CHARS = 24_000
 
 
 def representative_chunks(kb: KnowledgeBase, source_id: Optional[str] = None, budget: int = MAX_SUMMARY_CHARS) -> List[Chunk]:

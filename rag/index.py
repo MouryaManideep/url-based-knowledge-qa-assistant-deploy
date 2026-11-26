@@ -7,7 +7,7 @@ per-session limit of a few thousand chunks, takes well under a millisecond.
 from __future__ import annotations
 
 from collections import Counter
-from typing import Dict, List, Optional, Sequence
+from typing import Callable, Dict, List, Optional, Sequence
 
 import numpy as np
 
@@ -17,6 +17,7 @@ from rag.embeddings import Embedder, normalize_rows
 from rag.types import Chunk, Hit, Source, SourceError
 
 RRF_K = 60
+EMBED_BATCH = 64
 
 
 class KnowledgeBase:
@@ -48,14 +49,26 @@ class KnowledgeBase:
                 f"This would exceed the session limit of {self.max_chunks:,} passages. Remove a source or add a smaller one."
             )
 
-    def add(self, source: Source, chunks: Sequence[Chunk], embedder: Embedder) -> None:
+    def add(
+        self,
+        source: Source,
+        chunks: Sequence[Chunk],
+        embedder: Embedder,
+        progress: Optional[Callable[[int, int], None]] = None,
+    ) -> None:
         if source.id in self.sources:
             raise SourceError("This source is already in your knowledge base.")
         if not chunks:
             raise SourceError("No readable text was found.")
         self.check_capacity(len(chunks))
 
-        vectors = normalize_rows(embedder.embed_passages([c.embed_text for c in chunks]))
+        texts = [c.embed_text for c in chunks]
+        batches = []
+        for start in range(0, len(texts), EMBED_BATCH):  # Batches let the UI show progress on big files.
+            batches.append(np.asarray(embedder.embed_passages(texts[start:start + EMBED_BATCH]), dtype=np.float32))
+            if progress:
+                progress(min(start + EMBED_BATCH, len(texts)), len(texts))
+        vectors = normalize_rows(np.vstack(batches))
         if vectors.shape[0] != len(chunks):
             raise RuntimeError("Embedding count does not match chunk count")
         if self._vectors is not None and self._vectors.shape[1] != vectors.shape[1]:
