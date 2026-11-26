@@ -42,7 +42,8 @@ STARTER_QUESTIONS = [
     "What are the most important facts and figures?",
     "What conclusions or recommendations are made?",
 ]
-ICONS = {"web": "🌐", "pdf": "📄", "text": "📝"}
+ICONS = {"web": "🌐", "pdf": "📄", "text": "📝", "image": "🖼️"}
+UPLOAD_TYPES = ["pdf", "txt", "md", "png", "jpg", "jpeg", "webp"]
 
 st.set_page_config(page_title="Knowledge QA · Ask your sources", page_icon="📚", layout="wide", initial_sidebar_state="expanded")
 st.markdown(CSS, unsafe_allow_html=True)
@@ -113,12 +114,26 @@ def clear_chat() -> None:
 
 
 # ----------------------------------------------------------------------- ingestion
+def make_ocr():
+    """OCR for scans and photos, done by Gemini; None without an API key (the file is then explained, not read)."""
+    api_key = active_api_key()
+    if not api_key:
+        return None
+
+    def ocr(data: bytes, mime_type: str) -> str:
+        st.caption("No text layer found, so Gemini is reading it (OCR). This can take a minute…")
+        return GeminiClient(api_key, GEMINI_MODEL, on_event=lambda message: st.caption(message)).transcribe(data, mime_type)
+
+    return ocr
+
+
 def run_ingest(urls: List[str], files: List[Any]) -> None:
     jobs = [("url", u) for u in urls] + [("file", f) for f in files]
     if not jobs:
         st.toast("Add a link or a file first.", icon="ℹ️")
         return
     size, overlap = st.session_state.chunk_size, st.session_state.chunk_overlap
+    ocr = make_ocr()
     added, failed = 0, 0
     with st.status(f"Adding {len(jobs)} source{'s' if len(jobs) > 1 else ''}…", expanded=True) as status:
         embedder = None
@@ -133,13 +148,13 @@ def run_ingest(urls: List[str], files: List[Any]) -> None:
                         raise SourceError("Already in your knowledge base.")
                     kb.check_capacity()
                     st.caption(f"Fetching {md_code(label)}…")
-                    source, chunks = ingest_url(item, size, overlap)
+                    source, chunks = ingest_url(item, size, overlap, ocr=ocr)
                 else:
                     data = item.getvalue()
                     if kb.has_source(file_source_id(data)):
                         raise SourceError("Already in your knowledge base.")
                     kb.check_capacity()
-                    source, chunks = ingest_file(item.name, data, size, overlap)
+                    source, chunks = ingest_file(item.name, data, size, overlap, ocr=ocr)
                 kb.check_capacity(len(chunks))
                 embedder = embedder or load_embedder()
                 bar = st.progress(0.0, text=f"Indexing {len(chunks)} passages…")
@@ -148,7 +163,7 @@ def run_ingest(urls: List[str], files: List[Any]) -> None:
                 bar.empty()
                 added += 1
                 st.markdown(f"✅ **{md_escape(source.title)}** · {len(chunks)} passage{'s' if len(chunks) != 1 else ''}")
-            except SourceError as exc:
+            except (SourceError, LLMError) as exc:
                 failed += 1
                 st.markdown(f"⚠️ {shown} — {md_escape(exc)}")
             except Exception as exc:  # Never let one bad source crash the page.
@@ -181,7 +196,9 @@ with st.sidebar:
     st.markdown("#### Add sources")
     with st.form("add_sources", clear_on_submit=True, border=False):
         urls_text = st.text_area("Web pages", placeholder="https://example.com/article\nOne link per line", height=96)
-        uploads = st.file_uploader("Files", type=["pdf", "txt", "md"], accept_multiple_files=True, help="PDF, .txt or .md, up to 25 MB each")
+        uploads = st.file_uploader("Files", type=UPLOAD_TYPES, accept_multiple_files=True,
+                                   help="PDF, image (PNG, JPG, WebP), .txt or .md, up to 25 MB each. "
+                                        "Scanned PDFs and photos are read with Gemini OCR, which needs an API key.")
         submitted = st.form_submit_button("Add to knowledge base", type="primary")
 
     with st.expander("Answer & retrieval settings"):

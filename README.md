@@ -9,9 +9,10 @@ A lightweight, production-minded RAG assistant. Paste web links or upload PDFs, 
 - **Streaming answers** with inline `[n]` citations; each source card shows the passage, section/page, match score and a link.
 - **Strict or hybrid mode**: answer only from your sources, or allow clearly labelled general knowledge.
 - **Summaries**: overview, key points, takeaways and suggested follow-up questions for all sources or one.
-- **Source management**: web pages (HTML, plain text, or PDF links), PDF/.txt/.md uploads, duplicate detection, per-source removal.
+- **Source management**: web pages (HTML, plain text, or PDF links), PDF/.txt/.md uploads, duplicate detection, per-source removal, and an indexing progress bar for large files.
+- **OCR for scans and photos**: scanned PDFs with no text layer and photos of documents (PNG, JPG, WebP) are read by Gemini, keeping page numbers for citations. Needs an API key; limited to 30 pages and 18 MB per file.
 - **Export** a chat, with its cited sources, to Markdown.
-- **Resilient model calls**: transient Gemini errors (503/500) are retried with jitter, then the app falls back through a configurable list of models. Quota (429) and missing-model (404) errors move straight to the next model.
+- **Resilient model calls**: every request has a timeout and the whole retry chain a time budget, so nothing hangs. Transient errors (503/500/timeouts) are retried with jitter, then the app falls back through a configurable list of models; a model that just reported overload is skipped for 60 s. The UI shows what's happening and which model answered.
 
 ## Safe for many visitors
 
@@ -73,7 +74,7 @@ The smoke test runs the real app with Streamlit's `AppTest` when Streamlit is in
 ## Limitations
 
 - Knowledge bases are session-only and disappear on refresh. This is a deliberate privacy choice.
-- Scanned/image-only PDFs aren't OCR'd. Pages that need JavaScript or a login may not load.
+- OCR sends the whole scanned file to Gemini and is limited to 30 pages per file. Pages that need JavaScript or a login may not load.
 - URL checks don't pin DNS to the connection, so DNS rebinding can't be fully ruled out. If you expose this widely, add network-level egress controls.
 - Questions and retrieved passages are sent to Google Gemini. Review Google's data terms before using confidential documents.
 - Grounded prompting reduces unsupported answers but can't eliminate them, so verify important answers against the sources.
