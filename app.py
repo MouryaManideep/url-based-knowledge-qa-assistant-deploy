@@ -142,7 +142,10 @@ def run_ingest(urls: List[str], files: List[Any]) -> None:
                     source, chunks = ingest_file(item.name, data, size, overlap)
                 kb.check_capacity(len(chunks))
                 embedder = embedder or load_embedder()
-                kb.add(source, chunks, embedder)
+                bar = st.progress(0.0, text=f"Indexing {len(chunks)} passages…")
+                kb.add(source, chunks, embedder,
+                       progress=lambda done, total: bar.progress(done / total, text=f"Indexing passages {done:,}/{total:,}…"))
+                bar.empty()
                 added += 1
                 st.markdown(f"✅ **{md_escape(source.title)}** · {len(chunks)} passage{'s' if len(chunks) != 1 else ''}")
             except SourceError as exc:
@@ -240,6 +243,12 @@ def render_citations(message: Dict[str, Any]) -> None:
                 st.caption(md_escape(snippet[:320] + ("…" if len(snippet) > 320 else "")))
 
 
+def render_model_note(message: Dict[str, Any]) -> None:
+    model = message.get("model")
+    if model and model != GEMINI_MODEL:
+        st.caption(f"Answered by {md_code(model)} because {md_code(GEMINI_MODEL)} was busy.")
+
+
 def answer(question: str) -> None:
     question = question.strip()[:MAX_QUESTION_CHARS]
     if not question:
@@ -282,16 +291,17 @@ def answer(question: str) -> None:
         placeholder.markdown("_Thinking…_")
         buffer = ""
         try:
-            llm = GeminiClient(api_key, GEMINI_MODEL)
+            llm = GeminiClient(api_key, GEMINI_MODEL, on_event=lambda message: placeholder.markdown(f"_{message}_"))
             for delta in stream_answer(llm, question, hits, history, strict=strict):
                 buffer += delta
                 placeholder.markdown(sanitize_markdown(buffer) + " ▌")
             text = sanitize_markdown(buffer).strip() or "The model returned an empty response. Please try again."
             reply.update(content=text, citations=[] if is_not_found(text) else hits_to_citations(hits),
-                         cited=sorted(cited_numbers(text, len(hits))))
+                         cited=sorted(cited_numbers(text, len(hits))), model=llm.last_model)
         except LLMError as exc:
             reply.update(content=f"⚠️ {exc}", error=True)
         placeholder.markdown(reply["content"])
+        render_model_note(reply)
         render_citations(reply)
         messages.append(reply)
 
@@ -308,6 +318,7 @@ def render_chat() -> None:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
             if message["role"] == "assistant":
+                render_model_note(message)
                 render_citations(message)
 
     if not messages and not kb.is_empty:
@@ -349,12 +360,15 @@ def render_summary() -> None:
         if not api_key:
             st.warning("Add a Gemini API key in the sidebar first.")
         else:
-            try:
-                with st.spinner("Reading your sources…"):
-                    result = summarize(GeminiClient(api_key, GEMINI_MODEL), kb, scope)
-                st.session_state.summary = {"scope": scope, **result}
-            except LLMError as exc:
-                st.error(str(exc))
+            with st.status("Reading your sources…", expanded=True) as status:
+                try:
+                    llm = GeminiClient(api_key, GEMINI_MODEL, on_event=lambda message: st.caption(message))
+                    result = summarize(llm, kb, scope)
+                    st.session_state.summary = {"scope": scope, "model": llm.last_model, **result}
+                    status.update(label="Summary ready", state="complete", expanded=False)
+                except LLMError as exc:
+                    status.update(label="The summary couldn't be generated", state="error", expanded=True)
+                    st.error(str(exc))
 
     summary = st.session_state.summary
     if not summary or summary.get("scope") != scope:
@@ -367,7 +381,7 @@ def render_summary() -> None:
         if summary.get("takeaways"):
             st.markdown("#### Takeaways")
             st.markdown("\n".join(f"- {t}" for t in summary["takeaways"]))
-        st.caption(summary["coverage"])
+        st.caption(summary["coverage"] + (f" Written by {summary['model']}." if summary.get("model") else ""))
     if summary.get("questions"):
         st.markdown("##### Explore further")
         for i, q in enumerate(summary["questions"]):
