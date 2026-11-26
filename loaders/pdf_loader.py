@@ -1,68 +1,58 @@
-import fitz  # PyMuPDF
-from typing import List, Dict, Any, Optional
-import os
-from utils.logger import setup_logger
-MAX_PDF_BYTES = 25 * 1024 * 1024
-MAX_PDF_PAGES = 500
-MAX_EXTRACTED_CHARS = 5_000_000
+"""Extract text from PDFs page by page with pypdf (pure Python, permissive license)."""
+from __future__ import annotations
 
-# File: loaders/pdf_loader.py
-# Purpose: Read PDF files and turn each page into a simple text record for the RAG pipeline.
+import io
+from typing import List, Tuple
+
+from pypdf import PdfReader
+
+from config import MAX_EXTRACTED_CHARS, MAX_FILE_BYTES, MAX_PDF_PAGES
+from rag.types import SourceError
+from utils.logger import setup_logger
 
 logger = setup_logger("pdf_loader")
 
-def load_pdf_content(file_source: Any, file_name: str) -> List[Dict[str, Any]]:
-    """
-    Extracts text page-by-page from a PDF file path or file-like object (bytes).
-    Returns list of dicts: {"page_num": int, "text": str, "title": str, "source": str}
-    """
-    doc = None
+
+def load_pdf(data: bytes, file_name: str) -> Tuple[str, List[Tuple[int, str]]]:
+    """Return (title, [(page_number, text), ...]). Raises SourceError on unreadable input."""
+    if len(data) > MAX_FILE_BYTES:
+        raise SourceError("The PDF is larger than the 25 MB limit.")
     try:
-        if isinstance(file_source, bytes):
-            if len(file_source) > MAX_PDF_BYTES:
-                raise ValueError("PDF exceeds the configured size limit")
-            doc = fitz.open(stream=file_source, filetype="pdf")
-        elif isinstance(file_source, str) and os.path.exists(file_source):
-            if os.path.getsize(file_source) > MAX_PDF_BYTES:
-                raise ValueError("PDF exceeds the configured size limit")
-            doc = fitz.open(file_source)
-        else:
-            if hasattr(file_source, "read"):
-                content = file_source.read(MAX_PDF_BYTES + 1)
-                if len(content) > MAX_PDF_BYTES:
-                    raise ValueError("PDF exceeds the configured size limit")
-                doc = fitz.open(stream=content, filetype="pdf")
-            else:
-                raise ValueError("Unsupported PDF file source type.")
+        reader = PdfReader(io.BytesIO(data))
+        if reader.is_encrypted and not reader.decrypt(""):
+            raise SourceError("Password-protected PDFs are not supported.")
+        page_count = len(reader.pages)
+    except SourceError:
+        raise
+    except Exception as exc:
+        logger.warning("Could not open PDF (%s).", type(exc).__name__)
+        raise SourceError("This file is not a readable PDF.") from exc
 
-        if doc.needs_pass and not doc.authenticate(""):
-            raise ValueError("Password-protected PDFs are not supported")
-        if len(doc) > MAX_PDF_PAGES:
-            raise ValueError("PDF exceeds the configured page limit")
-        title = doc.metadata.get("title") or file_name
-        if not title:
-            title = "Uploaded PDF"
+    if page_count > MAX_PDF_PAGES:
+        raise SourceError(f"The PDF has {page_count} pages; the limit is {MAX_PDF_PAGES}.")
 
-        logger.info(f"Loading PDF with {len(doc)} pages: {file_name}")
-        pages_data = []
-        total_chars = 0
-        for page_idx in range(len(doc)):
-            page = doc.load_page(page_idx)
-            text = page.get_text()
-            total_chars += len(text)
-            if total_chars > MAX_EXTRACTED_CHARS:
-                raise ValueError("PDF extracted text exceeds the configured limit")
-            pages_data.append({
-                "page_num": page_idx + 1,
-                "text": text,
-                "title": title,
-                "source": file_name
-            })
-            
-        return pages_data
-    except Exception as e:
-        logger.warning("Could not read PDF (%s).", type(e).__name__)
-        return []
-    finally:
-        if doc is not None:
-            doc.close()
+    title = file_name
+    try:
+        meta_title = (reader.metadata or {}).get("/Title")
+        if meta_title and str(meta_title).strip():
+            title = str(meta_title).strip()
+    except Exception:
+        pass
+
+    pages: List[Tuple[int, str]] = []
+    total = 0
+    for number, page in enumerate(reader.pages, start=1):
+        try:
+            text = page.extract_text() or ""
+        except Exception as exc:  # One broken page should not sink the document.
+            logger.warning("Skipped unreadable PDF page %s (%s).", number, type(exc).__name__)
+            continue
+        total += len(text)
+        if total > MAX_EXTRACTED_CHARS:
+            raise SourceError("The PDF contains more text than this app can index in one go.")
+        if text.strip():
+            pages.append((number, text))
+
+    if not pages:
+        raise SourceError("No extractable text (scanned or image-only PDFs are not supported).")
+    return title, pages
